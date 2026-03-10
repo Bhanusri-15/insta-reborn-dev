@@ -1,34 +1,86 @@
 import { useAuth } from '@/contexts/AuthContext';
-import { useProfile, useProfileStats } from '@/hooks/useProfile';
+import { useProfile, useProfileStats, useUpdateProfile } from '@/hooks/useProfile';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
-import { Settings, Grid3X3, Film, Bookmark } from 'lucide-react';
+import { Settings, Grid3X3, Film, Bookmark, Camera } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { Skeleton } from '@/components/ui/skeleton';
-import { useState, useEffect } from 'react';
-import { supabase } from '@/integrations/supabase/client';
+import { useState, useEffect, useRef } from 'react';
+import { db } from '@/lib/firebase';
+import { collection, query, where, orderBy, onSnapshot, getDocs, doc, getDoc } from 'firebase/firestore';
+import { uploadFile, generateUploadPath } from '@/lib/storage';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
+import { toast } from 'sonner';
 
 const Profile = () => {
   const { user } = useAuth();
   const { data: profile, isLoading } = useProfile();
   const { data: stats } = useProfileStats();
+  const updateProfile = useUpdateProfile();
   const navigate = useNavigate();
   const [posts, setPosts] = useState<any[]>([]);
   const [reels, setReels] = useState<any[]>([]);
   const [saved, setSaved] = useState<any[]>([]);
+  const [uploadingAvatar, setUploadingAvatar] = useState(false);
+  const avatarInputRef = useRef<HTMLInputElement>(null);
 
+  // Real-time posts listener
   useEffect(() => {
-    if (user) {
-      supabase.from('posts').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
-        .then(({ data }) => setPosts(data || []));
-      supabase.from('reels').select('*').eq('user_id', user.id).order('created_at', { ascending: false })
-        .then(({ data }) => setReels(data || []));
-      supabase.from('saves').select('*, posts(*)').eq('user_id', user.id).order('created_at', { ascending: false })
-        .then(({ data }) => setSaved(data || []));
-    }
+    if (!user) return;
+    const postsQuery = query(collection(db, 'posts'), where('user_id', '==', user.uid), orderBy('created_at', 'desc'));
+    const unsubscribe = onSnapshot(postsQuery, (snap) => {
+      console.log('[Profile] Posts:', snap.size);
+      setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+    return () => unsubscribe();
   }, [user]);
+
+  // Real-time reels listener
+  useEffect(() => {
+    if (!user) return;
+    const reelsQuery = query(collection(db, 'reels'), where('user_id', '==', user.uid), orderBy('created_at', 'desc'));
+    const unsubscribe = onSnapshot(reelsQuery, (snap) => {
+      console.log('[Profile] Reels:', snap.size);
+      setReels(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+    return () => unsubscribe();
+  }, [user]);
+
+  // Fetch saved posts
+  useEffect(() => {
+    if (!user) return;
+    const fetchSaved = async () => {
+      const savesSnap = await getDocs(query(collection(db, 'saves'), where('user_id', '==', user.uid)));
+      const postIds = savesSnap.docs.map(d => d.data().post_id);
+      if (postIds.length === 0) { setSaved([]); return; }
+      const savedPosts = await Promise.all(
+        postIds.map(async (pid) => {
+          const postSnap = await getDoc(doc(db, 'posts', pid));
+          return postSnap.exists() ? { id: postSnap.id, ...postSnap.data() } : null;
+        })
+      );
+      setSaved(savedPosts.filter(Boolean));
+    };
+    fetchSaved();
+  }, [user]);
+
+  const handleAvatarUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !user) return;
+    setUploadingAvatar(true);
+    try {
+      const path = generateUploadPath('avatars', user.uid, file.name);
+      const url = await uploadFile(file, path);
+      await updateProfile.mutateAsync({ avatar_url: url });
+      toast.success('Profile photo updated!');
+      console.log('[Profile] Avatar updated:', url);
+    } catch (err: any) {
+      console.error('[Profile] Avatar upload error:', err);
+      toast.error('Failed to update profile photo');
+    }
+    setUploadingAvatar(false);
+  };
 
   if (isLoading) {
     return (
@@ -51,10 +103,20 @@ const Profile = () => {
       <div className="max-w-4xl mx-auto p-4">
         {/* Profile Header */}
         <div className="flex items-start gap-8 mb-6">
-          <Avatar className="h-20 w-20 md:h-36 md:w-36">
-            <AvatarImage src={profile?.avatar_url || ''} />
-            <AvatarFallback className="text-2xl">{profile?.username?.[0]?.toUpperCase() || '?'}</AvatarFallback>
-          </Avatar>
+          <div className="relative group">
+            <Avatar className="h-20 w-20 md:h-36 md:w-36">
+              <AvatarImage src={profile?.avatar_url || ''} />
+              <AvatarFallback className="text-2xl">{profile?.username?.[0]?.toUpperCase() || '?'}</AvatarFallback>
+            </Avatar>
+            <button
+              onClick={() => avatarInputRef.current?.click()}
+              disabled={uploadingAvatar}
+              className="absolute inset-0 flex items-center justify-center bg-black/40 rounded-full opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
+            >
+              <Camera className="h-6 w-6 text-white" />
+            </button>
+            <input ref={avatarInputRef} type="file" accept="image/*" className="hidden" onChange={handleAvatarUpload} />
+          </div>
 
           <div className="flex-1 space-y-4">
             <div className="flex items-center gap-4 flex-wrap">
@@ -142,9 +204,9 @@ const Profile = () => {
               </div>
             ) : (
               <div className="grid grid-cols-3 gap-1 mt-1">
-                {saved.map((save: any) => (
-                  <div key={save.id} className="aspect-square">
-                    <img src={save.posts?.media_url} alt="" className="w-full h-full object-cover" />
+                {saved.map((post: any) => (
+                  <div key={post.id} className="aspect-square">
+                    <img src={post.media_url} alt="" className="w-full h-full object-cover" />
                   </div>
                 ))}
               </div>

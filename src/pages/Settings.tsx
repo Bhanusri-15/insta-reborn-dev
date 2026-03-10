@@ -3,7 +3,8 @@ import { AppLayout } from '@/components/layout/AppLayout';
 import { useAuth } from '@/contexts/AuthContext';
 import { useProfile, useUpdateProfile } from '@/hooks/useProfile';
 import { useTheme } from '@/contexts/ThemeContext';
-import { supabase } from '@/integrations/supabase/client';
+import { updatePassword, EmailAuthProvider, reauthenticateWithCredential } from 'firebase/auth';
+import { auth } from '@/lib/firebase';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -60,12 +61,15 @@ const Settings = () => {
       toast.error('Password must be at least 6 characters');
       return;
     }
-    const { error } = await supabase.auth.updateUser({ password: newPassword });
-    if (error) toast.error(error.message);
-    else {
+    try {
+      if (!auth.currentUser) throw new Error('Not authenticated');
+      await updatePassword(auth.currentUser, newPassword);
       toast.success('Password updated!');
       setNewPassword('');
       setConfirmPassword('');
+    } catch (error: any) {
+      console.error('[Settings] Password change error:', error);
+      toast.error(error.message || 'Failed to update password');
     }
   };
 

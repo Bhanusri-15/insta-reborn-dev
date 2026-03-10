@@ -1,38 +1,63 @@
 import { useState, useEffect } from 'react';
 import { AppLayout } from '@/components/layout/AppLayout';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { collection, query, orderBy, limit, onSnapshot, getDocs, where, doc, getDoc } from 'firebase/firestore';
 import { Input } from '@/components/ui/input';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Search as SearchIcon } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 const Explore = () => {
-  const [query, setQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
   const [users, setUsers] = useState<any[]>([]);
   const [posts, setPosts] = useState<any[]>([]);
   const navigate = useNavigate();
 
+  // Real-time explore grid
   useEffect(() => {
-    // Load explore grid
-    supabase.from('posts')
-      .select('*, profiles!posts_user_id_fkey(username, avatar_url)')
-      .order('created_at', { ascending: false })
-      .limit(30)
-      .then(({ data }) => setPosts(data || []));
+    const postsQuery = query(
+      collection(db, 'posts'),
+      orderBy('created_at', 'desc'),
+      limit(30)
+    );
+
+    const unsubscribe = onSnapshot(postsQuery, async (snapshot) => {
+      console.log('[Explore] Posts snapshot:', snapshot.size);
+      const postsData = await Promise.all(
+        snapshot.docs.map(async (docSnap) => {
+          const post = { id: docSnap.id, ...docSnap.data() };
+          const authorSnap = await getDoc(doc(db, 'users', (post as any).user_id));
+          return { ...post, profiles: authorSnap.exists() ? authorSnap.data() : null };
+        })
+      );
+      setPosts(postsData);
+    });
+
+    return () => unsubscribe();
   }, []);
 
+  // Search users
   useEffect(() => {
-    if (!query.trim()) { setUsers([]); return; }
+    if (!searchQuery.trim()) { setUsers([]); return; }
     const timer = setTimeout(async () => {
-      const { data } = await supabase
-        .from('profiles')
-        .select('*')
-        .or(`username.ilike.%${query}%,display_name.ilike.%${query}%`)
-        .limit(10);
-      setUsers(data || []);
+      try {
+        // Firestore doesn't support ilike, so we do a prefix search
+        const q = searchQuery.trim().toLowerCase();
+        const usersSnap = await getDocs(collection(db, 'users'));
+        const matched = usersSnap.docs
+          .map(d => ({ uid: d.id, ...d.data() }))
+          .filter((u: any) =>
+            u.username?.toLowerCase().includes(q) ||
+            u.display_name?.toLowerCase().includes(q)
+          )
+          .slice(0, 10);
+        setUsers(matched);
+      } catch (err) {
+        console.error('[Explore] Search error:', err);
+      }
     }, 300);
     return () => clearTimeout(timer);
-  }, [query]);
+  }, [searchQuery]);
 
   return (
     <AppLayout>
@@ -42,19 +67,19 @@ const Explore = () => {
           <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
             placeholder="Search users..."
-            value={query}
-            onChange={e => setQuery(e.target.value)}
+            value={searchQuery}
+            onChange={e => setSearchQuery(e.target.value)}
             className="pl-10 bg-muted/50"
           />
         </div>
 
         {/* Search Results */}
-        {query.trim() && users.length > 0 && (
+        {searchQuery.trim() && users.length > 0 && (
           <div className="border border-border rounded-lg bg-card divide-y divide-border">
             {users.map(u => (
               <button
-                key={u.id}
-                onClick={() => navigate(`/user/${u.id}`)}
+                key={u.uid}
+                onClick={() => navigate(`/user/${u.uid}`)}
                 className="flex items-center gap-3 p-3 w-full hover:bg-muted/50 text-left"
               >
                 <Avatar className="h-10 w-10">
@@ -71,7 +96,7 @@ const Explore = () => {
         )}
 
         {/* Explore Grid */}
-        {!query.trim() && (
+        {!searchQuery.trim() && (
           <div className="grid grid-cols-3 gap-1">
             {posts.map(post => (
               <div key={post.id} className="aspect-square cursor-pointer">

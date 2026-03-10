@@ -1,7 +1,9 @@
 import { useState, useRef } from 'react';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { collection, addDoc, Timestamp } from 'firebase/firestore';
+import { uploadFile, generateUploadPath } from '@/lib/storage';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
@@ -9,9 +11,6 @@ import { ImagePlus, Film, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'sonner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-
-const CLOUDINARY_CLOUD_NAME = 'dw1a87ipd';
-const CLOUDINARY_UPLOAD_PRESET = 'network';
 
 const Create = () => {
   const { user } = useAuth();
@@ -30,56 +29,53 @@ const Create = () => {
     setPreview(URL.createObjectURL(f));
   };
 
-  const uploadToCloudinary = async (file: File): Promise<string> => {
-    const formData = new FormData();
-    formData.append('file', file);
-    formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
-
-    const resourceType = file.type.startsWith('video/') ? 'video' : 'image';
-    const res = await fetch(
-      `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/${resourceType}/upload`,
-      { method: 'POST', body: formData }
-    );
-    const data = await res.json();
-    if (!data.secure_url) throw new Error('Upload failed');
-    return data.secure_url;
-  };
-
   const handleSubmit = async () => {
     if (!file || !user) return;
     setUploading(true);
 
     try {
-      const mediaUrl = await uploadToCloudinary(file);
       const mediaType = file.type.startsWith('video/') ? 'video' : 'image';
+      const folder = type === 'reel' ? 'reels' : type === 'story' ? 'stories' : 'posts';
+      const path = generateUploadPath(folder, user.uid, file.name);
+      const mediaUrl = await uploadFile(file, path);
+      console.log('[Create] File uploaded:', mediaUrl);
 
       if (type === 'post') {
         const hashtags = caption.match(/#\w+/g)?.map(h => h.slice(1)) || [];
-        await supabase.from('posts').insert({
-          user_id: user.id,
+        await addDoc(collection(db, 'posts'), {
+          user_id: user.uid,
           media_url: mediaUrl,
           media_type: mediaType,
           caption,
-          hashtags: hashtags.length > 0 ? hashtags : null,
+          hashtags: hashtags.length > 0 ? hashtags : [],
+          created_at: Timestamp.now(),
         });
         toast.success('Post shared!');
+        console.log('[Create] Post created');
       } else if (type === 'story') {
-        await supabase.from('stories').insert({
-          user_id: user.id,
+        const expiresAt = Timestamp.fromDate(new Date(Date.now() + 24 * 60 * 60 * 1000));
+        await addDoc(collection(db, 'stories'), {
+          user_id: user.uid,
           media_url: mediaUrl,
           media_type: mediaType,
+          created_at: Timestamp.now(),
+          expires_at: expiresAt,
         });
         toast.success('Story added!');
+        console.log('[Create] Story created, expires at', expiresAt.toDate());
       } else if (type === 'reel') {
-        await supabase.from('reels').insert({
-          user_id: user.id,
+        await addDoc(collection(db, 'reels'), {
+          user_id: user.uid,
           video_url: mediaUrl,
           caption,
+          created_at: Timestamp.now(),
         });
         toast.success('Reel shared!');
+        console.log('[Create] Reel created');
       }
       navigate('/');
     } catch (err: any) {
+      console.error('[Create] Upload error:', err);
       toast.error(err.message || 'Failed to upload');
     }
     setUploading(false);

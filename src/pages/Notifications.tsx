@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { AppLayout } from '@/components/layout/AppLayout';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { collection, query, where, orderBy, limit, onSnapshot, doc, getDoc, writeBatch } from 'firebase/firestore';
 import { useAuth } from '@/contexts/AuthContext';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Heart, MessageCircle, UserPlus } from 'lucide-react';
@@ -11,25 +12,40 @@ const Notifications = () => {
 
   useEffect(() => {
     if (!user) return;
-    supabase.from('notifications')
-      .select('*, actor:actor_id(username, avatar_url)')
-      .eq('user_id', user.id)
-      .order('created_at', { ascending: false })
-      .limit(50)
-      .then(({ data }) => setNotifications(data || []));
 
-    // Mark as read
-    supabase.from('notifications').update({ is_read: true }).eq('user_id', user.id).eq('is_read', false).then(() => {});
+    const notifsQuery = query(
+      collection(db, 'notifications'),
+      where('user_id', '==', user.uid),
+      orderBy('created_at', 'desc'),
+      limit(50)
+    );
 
-    // Realtime
-    const channel = supabase
-      .channel('notifications')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications', filter: `user_id=eq.${user.id}` },
-        (payload) => setNotifications(prev => [payload.new as any, ...prev])
-      )
-      .subscribe();
+    const unsubscribe = onSnapshot(notifsQuery, async (snapshot) => {
+      console.log('[Notifications] Snapshot:', snapshot.size);
+      const notifsData = await Promise.all(
+        snapshot.docs.map(async (docSnap) => {
+          const notif = { id: docSnap.id, ...docSnap.data() };
+          let actor = null;
+          if ((notif as any).actor_id) {
+            const actorSnap = await getDoc(doc(db, 'users', (notif as any).actor_id));
+            if (actorSnap.exists()) actor = actorSnap.data();
+          }
+          return { ...notif, actor };
+        })
+      );
+      setNotifications(notifsData);
 
-    return () => { supabase.removeChannel(channel); };
+      // Mark unread as read
+      const batch = writeBatch(db);
+      snapshot.docs.forEach(d => {
+        if (!d.data().is_read) {
+          batch.update(d.ref, { is_read: true });
+        }
+      });
+      batch.commit().catch(err => console.error('[Notifications] Mark read error:', err));
+    });
+
+    return () => unsubscribe();
   }, [user]);
 
   const icon = (type: string) => {

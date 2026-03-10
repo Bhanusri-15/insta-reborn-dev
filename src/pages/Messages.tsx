@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { AppLayout } from '@/components/layout/AppLayout';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { collection, query, where, orderBy, onSnapshot, addDoc, getDocs, doc, getDoc, Timestamp } from 'firebase/firestore';
 import { useAuth } from '@/contexts/AuthContext';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Input } from '@/components/ui/input';
@@ -15,88 +16,78 @@ const Messages = () => {
   const [newMsg, setNewMsg] = useState('');
   const messagesEnd = useRef<HTMLDivElement>(null);
 
+  // Fetch conversations
   useEffect(() => {
     if (!user) return;
-    fetchConversations();
+
+    const convoQuery = query(
+      collection(db, 'conversations'),
+      where('participants', 'array-contains', user.uid),
+      orderBy('updated_at', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(convoQuery, async (snapshot) => {
+      console.log('[Messages] Conversations:', snapshot.size);
+      const convos = await Promise.all(
+        snapshot.docs.map(async (docSnap) => {
+          const convo = { id: docSnap.id, ...docSnap.data() };
+          const otherUid = (convo as any).participants?.find((p: string) => p !== user.uid);
+          let otherProfile = null;
+          if (otherUid) {
+            const profileSnap = await getDoc(doc(db, 'users', otherUid));
+            if (profileSnap.exists()) otherProfile = profileSnap.data();
+          }
+          // Get last message
+          const msgsSnap = await getDocs(query(
+            collection(db, 'messages'),
+            where('conversation_id', '==', docSnap.id),
+            orderBy('created_at', 'desc')
+          ));
+          const lastMsg = msgsSnap.docs[0]?.data() || null;
+          return { ...convo, other: otherProfile, lastMessage: lastMsg };
+        })
+      );
+      setConversations(convos);
+    });
+
+    return () => unsubscribe();
   }, [user]);
 
+  // Real-time messages for active conversation
   useEffect(() => {
     if (!activeConvo) return;
-    fetchMessages(activeConvo);
 
-    const channel = supabase
-      .channel(`messages-${activeConvo}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${activeConvo}` },
-        (payload) => {
-          setMessages(prev => [...prev, payload.new]);
-        }
-      )
-      .subscribe();
+    const msgsQuery = query(
+      collection(db, 'messages'),
+      where('conversation_id', '==', activeConvo),
+      orderBy('created_at', 'asc')
+    );
 
-    return () => { supabase.removeChannel(channel); };
+    const unsubscribe = onSnapshot(msgsQuery, (snapshot) => {
+      console.log('[Messages] Messages:', snapshot.size);
+      setMessages(snapshot.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+
+    return () => unsubscribe();
   }, [activeConvo]);
 
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const fetchConversations = async () => {
-    if (!user) return;
-    const { data: parts } = await supabase
-      .from('conversation_participants')
-      .select('conversation_id')
-      .eq('user_id', user.id);
-
-    if (!parts?.length) return;
-    const convoIds = parts.map(p => p.conversation_id);
-
-    const { data: convos } = await supabase
-      .from('conversations')
-      .select('*')
-      .in('id', convoIds)
-      .order('updated_at', { ascending: false });
-
-    if (!convos) return;
-
-    // Get other participants
-    const enriched = await Promise.all(convos.map(async (c) => {
-      const { data: participants } = await supabase
-        .from('conversation_participants')
-        .select('user_id, profiles:user_id(username, avatar_url, display_name)')
-        .eq('conversation_id', c.id)
-        .neq('user_id', user.id);
-
-      const { data: lastMsg } = await supabase
-        .from('messages')
-        .select('content, created_at')
-        .eq('conversation_id', c.id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      return { ...c, other: participants?.[0]?.profiles, lastMessage: lastMsg };
-    }));
-
-    setConversations(enriched);
-  };
-
-  const fetchMessages = async (convoId: string) => {
-    const { data } = await supabase
-      .from('messages')
-      .select('*, profiles:sender_id(username, avatar_url)')
-      .eq('conversation_id', convoId)
-      .order('created_at', { ascending: true });
-    setMessages(data || []);
-  };
-
   const sendMessage = async () => {
     if (!newMsg.trim() || !activeConvo || !user) return;
-    await supabase.from('messages').insert({
-      conversation_id: activeConvo,
-      sender_id: user.id,
-      content: newMsg,
-    });
-    setNewMsg('');
+    try {
+      await addDoc(collection(db, 'messages'), {
+        conversation_id: activeConvo,
+        sender_id: user.uid,
+        content: newMsg.trim(),
+        created_at: Timestamp.now(),
+      });
+      setNewMsg('');
+    } catch (err) {
+      console.error('[Messages] Send error:', err);
+    }
   };
 
   return (
@@ -144,9 +135,9 @@ const Messages = () => {
               </div>
               <div className="flex-1 overflow-y-auto p-4 space-y-3">
                 {messages.map(msg => (
-                  <div key={msg.id} className={`flex ${msg.sender_id === user?.id ? 'justify-end' : 'justify-start'}`}>
+                  <div key={msg.id} className={`flex ${msg.sender_id === user?.uid ? 'justify-end' : 'justify-start'}`}>
                     <div className={`max-w-[70%] px-3 py-2 rounded-2xl text-sm ${
-                      msg.sender_id === user?.id ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'
+                      msg.sender_id === user?.uid ? 'bg-primary text-primary-foreground' : 'bg-muted text-foreground'
                     }`}>
                       {msg.content}
                     </div>

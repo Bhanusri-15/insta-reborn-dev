@@ -1,22 +1,31 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { supabase } from '@/integrations/supabase/client';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
+import { db } from '@/lib/firebase';
 import { useAuth } from '@/contexts/AuthContext';
+
+export interface UserProfile {
+  uid: string;
+  email: string;
+  username: string;
+  display_name: string;
+  avatar_url: string;
+  bio: string;
+  website: string;
+  is_private: boolean;
+  created_at: any;
+}
 
 export function useProfile(userId?: string) {
   const { user } = useAuth();
-  const id = userId || user?.id;
+  const id = userId || user?.uid;
 
   return useQuery({
     queryKey: ['profile', id],
-    queryFn: async () => {
+    queryFn: async (): Promise<UserProfile | null> => {
       if (!id) return null;
-      const { data, error } = await supabase
-        .from('profiles')
-        .select('*')
-        .eq('id', id)
-        .single();
-      if (error) throw error;
-      return data;
+      const snap = await getDoc(doc(db, 'users', id));
+      if (!snap.exists()) return null;
+      return { uid: snap.id, ...snap.data() } as UserProfile;
     },
     enabled: !!id,
   });
@@ -27,42 +36,39 @@ export function useUpdateProfile() {
   const { user } = useAuth();
 
   return useMutation({
-    mutationFn: async (updates: { display_name?: string; bio?: string; website?: string; avatar_url?: string; username?: string; is_private?: boolean }) => {
+    mutationFn: async (updates: Partial<Pick<UserProfile, 'display_name' | 'bio' | 'website' | 'avatar_url' | 'username' | 'is_private'>>) => {
       if (!user) throw new Error('Not authenticated');
-      const { data, error } = await supabase
-        .from('profiles')
-        .update(updates)
-        .eq('id', user.id)
-        .select()
-        .single();
-      if (error) throw error;
-      return data;
+      const userRef = doc(db, 'users', user.uid);
+      await updateDoc(userRef, updates);
+      const snap = await getDoc(userRef);
+      return { uid: snap.id, ...snap.data() } as UserProfile;
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['profile', user?.id] });
+      queryClient.invalidateQueries({ queryKey: ['profile', user?.uid] });
     },
   });
 }
 
 export function useProfileStats(userId?: string) {
   const { user } = useAuth();
-  const id = userId || user?.id;
+  const id = userId || user?.uid;
 
   return useQuery({
     queryKey: ['profile-stats', id],
     queryFn: async () => {
       if (!id) return { posts: 0, followers: 0, following: 0 };
-      
-      const [postsRes, followersRes, followingRes] = await Promise.all([
-        supabase.from('posts').select('id', { count: 'exact', head: true }).eq('user_id', id),
-        supabase.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', id).eq('status', 'accepted'),
-        supabase.from('follows').select('id', { count: 'exact', head: true }).eq('follower_id', id).eq('status', 'accepted'),
+      const { getDocs, collection, query, where } = await import('firebase/firestore');
+
+      const [postsSnap, followersSnap, followingSnap] = await Promise.all([
+        getDocs(query(collection(db, 'posts'), where('user_id', '==', id))),
+        getDocs(query(collection(db, 'follows'), where('following_id', '==', id), where('status', '==', 'accepted'))),
+        getDocs(query(collection(db, 'follows'), where('follower_id', '==', id), where('status', '==', 'accepted'))),
       ]);
 
       return {
-        posts: postsRes.count || 0,
-        followers: followersRes.count || 0,
-        following: followingRes.count || 0,
+        posts: postsSnap.size,
+        followers: followersSnap.size,
+        following: followingSnap.size,
       };
     },
     enabled: !!id,

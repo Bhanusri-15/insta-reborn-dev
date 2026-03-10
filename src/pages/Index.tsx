@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { collection, query, orderBy, limit, onSnapshot, doc, getDoc, getDocs, where, setDoc, deleteDoc, Timestamp } from 'firebase/firestore';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Heart, MessageCircle, Bookmark, Send, MoreHorizontal } from 'lucide-react';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -12,89 +13,119 @@ const Index = () => {
   const [loading, setLoading] = useState(true);
   const [stories, setStories] = useState<any[]>([]);
 
+  // Real-time posts listener
   useEffect(() => {
-    if (user) {
-      fetchFeed();
-      fetchStories();
-    }
+    if (!user) return;
+
+    const postsQuery = query(
+      collection(db, 'posts'),
+      orderBy('created_at', 'desc'),
+      limit(30)
+    );
+
+    const unsubscribe = onSnapshot(postsQuery, async (snapshot) => {
+      console.log('[Home] Posts snapshot:', snapshot.size, 'docs');
+      const postsData = await Promise.all(
+        snapshot.docs.map(async (docSnap) => {
+          const post = { id: docSnap.id, ...docSnap.data() };
+          // Fetch author profile
+          const authorSnap = await getDoc(doc(db, 'users', (post as any).user_id));
+          const author = authorSnap.exists() ? authorSnap.data() : null;
+
+          // Fetch like/save/comment counts
+          const likesSnap = await getDocs(query(collection(db, 'likes'), where('post_id', '==', docSnap.id)));
+          const commentsSnap = await getDocs(query(collection(db, 'comments'), where('post_id', '==', docSnap.id)));
+          const userLike = await getDocs(query(collection(db, 'likes'), where('post_id', '==', docSnap.id), where('user_id', '==', user.uid)));
+          const userSave = await getDocs(query(collection(db, 'saves'), where('post_id', '==', docSnap.id), where('user_id', '==', user.uid)));
+
+          return {
+            ...post,
+            profiles: author,
+            likes_count: likesSnap.size,
+            comments_count: commentsSnap.size,
+            is_liked: !userLike.empty,
+            is_saved: !userSave.empty,
+          };
+        })
+      );
+      setPosts(postsData);
+      setLoading(false);
+    }, (error) => {
+      console.error('[Home] Posts listener error:', error);
+      setLoading(false);
+    });
+
+    return () => unsubscribe();
   }, [user]);
 
-  const fetchFeed = async () => {
+  // Real-time stories listener (only stories not expired)
+  useEffect(() => {
     if (!user) return;
-    setLoading(true);
-    const { data: follows } = await supabase
-      .from('follows')
-      .select('following_id')
-      .eq('follower_id', user.id)
-      .eq('status', 'accepted');
 
-    const followedIds = follows?.map(f => f.following_id) || [];
-    followedIds.push(user.id);
+    const storiesQuery = query(
+      collection(db, 'stories'),
+      where('expires_at', '>', Timestamp.now()),
+      orderBy('expires_at', 'desc'),
+      limit(30)
+    );
 
-    const { data: postsData } = await supabase
-      .from('posts')
-      .select('*, profiles!posts_user_id_fkey(username, avatar_url, display_name)')
-      .in('user_id', followedIds)
-      .order('created_at', { ascending: false })
-      .limit(20);
+    const unsubscribe = onSnapshot(storiesQuery, async (snapshot) => {
+      console.log('[Home] Stories snapshot:', snapshot.size, 'docs');
+      const storiesData = await Promise.all(
+        snapshot.docs.map(async (docSnap) => {
+          const story = { id: docSnap.id, ...docSnap.data() };
+          const authorSnap = await getDoc(doc(db, 'users', (story as any).user_id));
+          return { ...story, profiles: authorSnap.exists() ? authorSnap.data() : null };
+        })
+      );
+      setStories(storiesData);
+    }, (error) => {
+      console.error('[Home] Stories listener error:', error);
+    });
 
-    if (postsData) {
-      const enriched = await Promise.all(postsData.map(async (post: any) => {
-        const [likesRes, commentsRes, likedRes, savedRes] = await Promise.all([
-          supabase.from('likes').select('id', { count: 'exact', head: true }).eq('post_id', post.id),
-          supabase.from('comments').select('id', { count: 'exact', head: true }).eq('post_id', post.id),
-          supabase.from('likes').select('id').eq('post_id', post.id).eq('user_id', user.id).maybeSingle(),
-          supabase.from('saves').select('id').eq('post_id', post.id).eq('user_id', user.id).maybeSingle(),
-        ]);
-        return {
-          ...post,
-          likes_count: likesRes.count || 0,
-          comments_count: commentsRes.count || 0,
-          is_liked: !!likedRes.data,
-          is_saved: !!savedRes.data,
-        };
-      }));
-      setPosts(enriched);
-    }
-    setLoading(false);
-  };
-
-  const fetchStories = async () => {
-    if (!user) return;
-    const { data } = await supabase
-      .from('stories')
-      .select('*, profiles!stories_user_id_fkey(username, avatar_url)')
-      .gt('expires_at', new Date().toISOString())
-      .order('created_at', { ascending: false });
-    setStories(data || []);
-  };
+    return () => unsubscribe();
+  }, [user]);
 
   const toggleLike = async (postId: string, isLiked: boolean) => {
     if (!user) return;
-    if (isLiked) {
-      await supabase.from('likes').delete().eq('post_id', postId).eq('user_id', user.id);
-    } else {
-      await supabase.from('likes').insert({ user_id: user.id, post_id: postId });
+    const likeId = `${user.uid}_${postId}`;
+    const likeRef = doc(db, 'likes', likeId);
+    try {
+      if (isLiked) {
+        await deleteDoc(likeRef);
+      } else {
+        await setDoc(likeRef, { user_id: user.uid, post_id: postId, created_at: Timestamp.now() });
+      }
+      // Optimistic update
+      setPosts(prev => prev.map(p =>
+        p.id === postId ? { ...p, is_liked: !isLiked, likes_count: p.likes_count + (isLiked ? -1 : 1) } : p
+      ));
+    } catch (err) {
+      console.error('[Home] Toggle like error:', err);
     }
-    setPosts(prev => prev.map(p =>
-      p.id === postId ? { ...p, is_liked: !isLiked, likes_count: p.likes_count + (isLiked ? -1 : 1) } : p
-    ));
   };
 
   const toggleSave = async (postId: string, isSaved: boolean) => {
     if (!user) return;
-    if (isSaved) {
-      await supabase.from('saves').delete().eq('post_id', postId).eq('user_id', user.id);
-    } else {
-      await supabase.from('saves').insert({ user_id: user.id, post_id: postId });
+    const saveId = `${user.uid}_${postId}`;
+    const saveRef = doc(db, 'saves', saveId);
+    try {
+      if (isSaved) {
+        await deleteDoc(saveRef);
+      } else {
+        await setDoc(saveRef, { user_id: user.uid, post_id: postId, created_at: Timestamp.now() });
+      }
+      setPosts(prev => prev.map(p =>
+        p.id === postId ? { ...p, is_saved: !isSaved } : p
+      ));
+    } catch (err) {
+      console.error('[Home] Toggle save error:', err);
     }
-    setPosts(prev => prev.map(p =>
-      p.id === postId ? { ...p, is_saved: !isSaved } : p
-    ));
   };
 
-  const timeAgo = (date: string) => {
-    const seconds = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
+  const timeAgo = (date: any) => {
+    const ts = date?.toDate ? date.toDate() : new Date(date);
+    const seconds = Math.floor((Date.now() - ts.getTime()) / 1000);
     if (seconds < 60) return 'just now';
     if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
     if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;

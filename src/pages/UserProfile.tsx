@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { AppLayout } from '@/components/layout/AppLayout';
 import { useAuth } from '@/contexts/AuthContext';
-import { supabase } from '@/integrations/supabase/client';
+import { db } from '@/lib/firebase';
+import { doc, getDoc, collection, query, where, orderBy, onSnapshot, getDocs, setDoc, deleteDoc, Timestamp } from 'firebase/firestore';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Button } from '@/components/ui/button';
 import { Grid3X3 } from 'lucide-react';
@@ -20,34 +21,43 @@ const UserProfile = () => {
   useEffect(() => {
     if (!userId) return;
     fetchProfile();
-    fetchPosts();
     fetchStats();
     if (user) checkFollowing();
   }, [userId, user]);
 
-  const fetchProfile = async () => {
-    const { data } = await supabase.from('profiles').select('*').eq('id', userId!).single();
-    setProfile(data);
-  };
+  // Real-time posts
+  useEffect(() => {
+    if (!userId) return;
+    const postsQuery = query(collection(db, 'posts'), where('user_id', '==', userId), orderBy('created_at', 'desc'));
+    const unsubscribe = onSnapshot(postsQuery, (snap) => {
+      setPosts(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    });
+    return () => unsubscribe();
+  }, [userId]);
 
-  const fetchPosts = async () => {
-    const { data } = await supabase.from('posts').select('*').eq('user_id', userId!).order('created_at', { ascending: false });
-    setPosts(data || []);
+  const fetchProfile = async () => {
+    const snap = await getDoc(doc(db, 'users', userId!));
+    if (snap.exists()) setProfile({ uid: snap.id, ...snap.data() });
   };
 
   const fetchStats = async () => {
-    const [p, fr, fg] = await Promise.all([
-      supabase.from('posts').select('id', { count: 'exact', head: true }).eq('user_id', userId!),
-      supabase.from('follows').select('id', { count: 'exact', head: true }).eq('following_id', userId!).eq('status', 'accepted'),
-      supabase.from('follows').select('id', { count: 'exact', head: true }).eq('follower_id', userId!).eq('status', 'accepted'),
+    const [postsSnap, followersSnap, followingSnap] = await Promise.all([
+      getDocs(query(collection(db, 'posts'), where('user_id', '==', userId!))),
+      getDocs(query(collection(db, 'follows'), where('following_id', '==', userId!), where('status', '==', 'accepted'))),
+      getDocs(query(collection(db, 'follows'), where('follower_id', '==', userId!), where('status', '==', 'accepted'))),
     ]);
-    setStats({ posts: p.count || 0, followers: fr.count || 0, following: fg.count || 0 });
+    setStats({ posts: postsSnap.size, followers: followersSnap.size, following: followingSnap.size });
   };
 
   const checkFollowing = async () => {
     if (!user || !userId) return;
-    const { data } = await supabase.from('follows').select('status').eq('follower_id', user.id).eq('following_id', userId).maybeSingle();
-    if (data) {
+    const followSnap = await getDocs(query(
+      collection(db, 'follows'),
+      where('follower_id', '==', user.uid),
+      where('following_id', '==', userId)
+    ));
+    if (!followSnap.empty) {
+      const data = followSnap.docs[0].data();
       setIsFollowing(true);
       setFollowStatus(data.status);
     }
@@ -55,24 +65,35 @@ const UserProfile = () => {
 
   const handleFollow = async () => {
     if (!user || !userId) return;
-    if (isFollowing) {
-      await supabase.from('follows').delete().eq('follower_id', user.id).eq('following_id', userId);
-      setIsFollowing(false);
-      setFollowStatus(null);
-      setStats(prev => ({ ...prev, followers: prev.followers - 1 }));
-    } else {
-      const status = profile?.is_private ? 'pending' : 'accepted';
-      await supabase.from('follows').insert({ follower_id: user.id, following_id: userId, status });
-      setIsFollowing(true);
-      setFollowStatus(status);
-      if (status === 'accepted') setStats(prev => ({ ...prev, followers: prev.followers + 1 }));
-      else toast.info('Follow request sent');
+    const followId = `${user.uid}_${userId}`;
+    const followRef = doc(db, 'follows', followId);
+    try {
+      if (isFollowing) {
+        await deleteDoc(followRef);
+        setIsFollowing(false);
+        setFollowStatus(null);
+        setStats(prev => ({ ...prev, followers: prev.followers - 1 }));
+      } else {
+        const status = profile?.is_private ? 'pending' : 'accepted';
+        await setDoc(followRef, {
+          follower_id: user.uid,
+          following_id: userId,
+          status,
+          created_at: Timestamp.now(),
+        });
+        setIsFollowing(true);
+        setFollowStatus(status);
+        if (status === 'accepted') setStats(prev => ({ ...prev, followers: prev.followers + 1 }));
+        else toast.info('Follow request sent');
+      }
+    } catch (err) {
+      console.error('[UserProfile] Follow error:', err);
     }
   };
 
   if (!profile) return <AppLayout><div className="flex items-center justify-center h-64 text-muted-foreground">Loading...</div></AppLayout>;
 
-  const isOwnProfile = user?.id === userId;
+  const isOwnProfile = user?.uid === userId;
 
   return (
     <AppLayout>
